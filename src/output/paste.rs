@@ -9,16 +9,28 @@
 //!   - wtype: Wayland-native, no daemon needed (preferred)
 //!   - eitype: EI protocol, works on GNOME/KDE/Sway with libei
 //!   - ydotool: Works on X11/Wayland/TTY, requires ydotoold daemon
+//!
+//! macOS: pbcopy/pbpaste for the clipboard and a synthetic CGEvent keystroke
+//! for the paste step — no external tools. Keys with no Mac keycode (e.g.
+//! `insert` from the shipped `shift+insert` default) fall back to cmd+v.
+//! Needs the same Accessibility permission as type mode.
 
-use super::session::{detect, DisplaySession};
 use super::TextOutput;
 use crate::config::OutputDriver;
 use crate::error::OutputError;
-use crate::output::find_ydotool_socket;
-use crate::output::xclip::copy_to_x11_clipboard;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+
+#[cfg(not(target_os = "macos"))]
+use super::session::{detect, DisplaySession};
+#[cfg(not(target_os = "macos"))]
+use crate::output::find_ydotool_socket;
+#[cfg(not(target_os = "macos"))]
+use crate::output::xclip::copy_to_x11_clipboard;
+
+#[cfg(target_os = "macos")]
+use super::pbcopy::PbcopyOutput;
 
 /// Keystroke-capable drivers, in the order tried when the configured
 /// `driver_order` doesn't name any of them. dotool/clipboard/xclip have no
@@ -90,6 +102,7 @@ impl ParsedKeystroke {
 
     /// Convert to wtype arguments
     /// e.g., "ctrl+v" -> ["-M", "ctrl", "-k", "v", "-m", "ctrl"]
+    #[cfg(not(target_os = "macos"))]
     fn to_wtype_args(&self) -> Vec<String> {
         let mut args = Vec::new();
 
@@ -114,6 +127,7 @@ impl ParsedKeystroke {
 
     /// Convert to eitype arguments
     /// e.g., "ctrl+v" -> ["-M", "ctrl", "-k", "v"]
+    #[cfg(not(target_os = "macos"))]
     fn to_eitype_args(&self) -> Vec<String> {
         let mut args = Vec::new();
 
@@ -132,6 +146,8 @@ impl ParsedKeystroke {
 
     /// Convert to ydotool key arguments using evdev codes
     /// e.g., "ctrl+v" -> ["29:1", "47:1", "47:0", "29:0"]
+    /// Convert to ydotool arguments
+    #[cfg(not(target_os = "macos"))]
     fn to_ydotool_args(&self) -> Result<Vec<String>, String> {
         let mut args = Vec::new();
 
@@ -164,6 +180,7 @@ impl ParsedKeystroke {
 }
 
 /// Convert a key name to its evdev code
+#[cfg(not(target_os = "macos"))]
 fn key_name_to_evdev(name: &str) -> Result<u16, String> {
     match name.to_lowercase().as_str() {
         // Modifiers
@@ -289,12 +306,23 @@ impl PasteOutput {
         }
     }
 
-    /// Copy text to clipboard, dispatching by session type.
+    /// Copy text to clipboard, dispatching by platform/session.
     ///
-    /// Wayland sessions use `wl-copy`; X11 sessions use `xclip` (preferred)
-    /// or `xsel` (fallback). Without this dispatch, X11 users see voxtype
-    /// silently no-op on the clipboard (GitHub #346).
+    /// macOS uses pbcopy. Wayland sessions use `wl-copy`; X11 sessions use
+    /// `xclip` (preferred) or `xsel` (fallback). Without this dispatch, X11
+    /// users see voxtype silently no-op on the clipboard (GitHub #346).
     async fn copy_to_clipboard(&self, text: &str) -> Result<(), OutputError> {
+        #[cfg(target_os = "macos")]
+        {
+            return self.copy_to_clipboard_macos(text).await;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        self.copy_to_clipboard_unix(text).await
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    async fn copy_to_clipboard_unix(&self, text: &str) -> Result<(), OutputError> {
         if detect() == DisplaySession::X11 {
             return copy_to_x11_clipboard(text.as_bytes()).await;
         }
@@ -341,8 +369,20 @@ impl PasteOutput {
         Ok(())
     }
 
-    /// Read current clipboard content using wl-paste (Wayland) or xclip (X11 fallback)
+    /// Read current clipboard content for restoration.
     async fn read_clipboard(&self) -> Result<Option<ClipboardContent>, OutputError> {
+        #[cfg(target_os = "macos")]
+        {
+            return self.read_clipboard_macos().await;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        self.read_clipboard_unix().await
+    }
+
+    /// Read clipboard using wl-paste (Wayland) or xclip (X11 fallback)
+    #[cfg(not(target_os = "macos"))]
+    async fn read_clipboard_unix(&self) -> Result<Option<ClipboardContent>, OutputError> {
         // Try wl-paste first (Wayland)
         if std::env::var("WAYLAND_DISPLAY").is_ok() {
             match self.read_clipboard_wl_paste().await {
@@ -358,6 +398,7 @@ impl PasteOutput {
     }
 
     /// Read clipboard using wl-paste
+    #[cfg(not(target_os = "macos"))]
     async fn read_clipboard_wl_paste(&self) -> Result<Option<ClipboardContent>, OutputError> {
         // First, check if clipboard is empty by listing types
         let types_output = Command::new("wl-paste")
@@ -425,6 +466,7 @@ impl PasteOutput {
     }
 
     /// Read clipboard using xclip (X11 fallback)
+    #[cfg(not(target_os = "macos"))]
     async fn read_clipboard_xclip(&self) -> Result<Option<ClipboardContent>, OutputError> {
         // Check if DISPLAY is set (X11 environment)
         if std::env::var("DISPLAY").is_err() {
@@ -477,8 +519,23 @@ impl PasteOutput {
         }))
     }
 
-    /// Restore clipboard content using wl-copy or xclip
+    /// Restore clipboard content using wl-copy, xclip, or pbcopy
     async fn restore_clipboard_content(
+        &self,
+        content: &ClipboardContent,
+    ) -> Result<(), OutputError> {
+        #[cfg(target_os = "macos")]
+        {
+            return self.restore_clipboard_content_macos(content).await;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        self.restore_clipboard_content_unix(content).await
+    }
+
+    /// Restore clipboard content using wl-copy or xclip
+    #[cfg(not(target_os = "macos"))]
+    async fn restore_clipboard_content_unix(
         &self,
         content: &ClipboardContent,
     ) -> Result<(), OutputError> {
@@ -497,6 +554,7 @@ impl PasteOutput {
     }
 
     /// Restore clipboard using wl-copy with MIME type preservation
+    #[cfg(not(target_os = "macos"))]
     async fn restore_clipboard_wl_copy(
         &self,
         content: &ClipboardContent,
@@ -539,6 +597,7 @@ impl PasteOutput {
     }
 
     /// Restore clipboard using xclip
+    #[cfg(not(target_os = "macos"))]
     async fn restore_clipboard_xclip(&self, content: &ClipboardContent) -> Result<(), OutputError> {
         let mut child = Command::new("xclip")
             .args(["-selection", "clipboard"])
@@ -577,6 +636,7 @@ impl PasteOutput {
     }
 
     /// Check if wtype is available
+    #[cfg(not(target_os = "macos"))]
     async fn is_wtype_available(&self) -> bool {
         // Check if wtype exists
         let wtype_installed = Command::new("which")
@@ -597,6 +657,7 @@ impl PasteOutput {
     }
 
     /// Check if eitype is available
+    #[cfg(not(target_os = "macos"))]
     async fn is_eitype_available(&self) -> bool {
         Command::new("which")
             .arg("eitype")
@@ -609,6 +670,7 @@ impl PasteOutput {
     }
 
     /// Check if ydotool is available (installed and daemon running)
+    #[cfg(not(target_os = "macos"))]
     async fn is_ydotool_available(&self) -> bool {
         // Check if ydotool exists
         let ydotool_installed = Command::new("which")
@@ -639,6 +701,7 @@ impl PasteOutput {
     }
 
     /// Simulate paste keystroke using wtype
+    #[cfg(not(target_os = "macos"))]
     async fn simulate_paste_wtype(&self) -> Result<(), OutputError> {
         let args = self.keystroke.to_wtype_args();
         tracing::debug!("Running: wtype {}", args.join(" "));
@@ -669,6 +732,7 @@ impl PasteOutput {
     }
 
     /// Simulate paste keystroke using eitype
+    #[cfg(not(target_os = "macos"))]
     async fn simulate_paste_eitype(&self) -> Result<(), OutputError> {
         let args = self.keystroke.to_eitype_args();
         tracing::debug!("Running: eitype {}", args.join(" "));
@@ -699,6 +763,7 @@ impl PasteOutput {
     }
 
     /// Simulate paste keystroke using ydotool
+    #[cfg(not(target_os = "macos"))]
     async fn simulate_paste_ydotool(&self) -> Result<(), OutputError> {
         let args = self.keystroke.to_ydotool_args().map_err(|e| {
             OutputError::CtrlVFailed(format!("Cannot convert keystroke for ydotool: {}", e))
@@ -753,7 +818,20 @@ impl PasteOutput {
     /// Simulate paste keystroke, trying each driver in `self.driver_order`
     /// (derived from `[output] driver_order`, defaulting to
     /// wtype -> eitype -> ydotool) until one succeeds.
+    /// Simulate the paste keystroke.
     async fn simulate_paste_keystroke(&self) -> Result<(), OutputError> {
+        #[cfg(target_os = "macos")]
+        {
+            return self.simulate_paste_keystroke_macos().await;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        self.simulate_paste_keystroke_unix().await
+    }
+
+    /// Simulate paste keystroke using wtype/eitype/ydotool (Linux)
+    #[cfg(not(target_os = "macos"))]
+    async fn simulate_paste_keystroke_unix(&self) -> Result<(), OutputError> {
         let mut tried = Vec::new();
 
         for driver in &self.driver_order {
@@ -802,6 +880,17 @@ impl PasteOutput {
     /// Send Enter key after paste, trying the same driver order as the paste
     /// keystroke itself.
     async fn send_enter(&self) -> Result<(), OutputError> {
+        #[cfg(target_os = "macos")]
+        {
+            return self.send_enter_macos().await;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        self.send_enter_unix().await
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    async fn send_enter_unix(&self) -> Result<(), OutputError> {
         for driver in &self.driver_order {
             let available = match driver {
                 OutputDriver::Wtype => self.is_wtype_available().await,
@@ -854,6 +943,128 @@ impl PasteOutput {
         // Best effort - don't fail the whole operation for Enter
         tracing::warn!("Failed to send Enter key");
         Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn copy_to_clipboard_macos(&self, text: &str) -> Result<(), OutputError> {
+        PbcopyOutput::new(false).output(text).await
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn read_clipboard_macos(&self) -> Result<Option<ClipboardContent>, OutputError> {
+        let output = Command::new("pbpaste")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| OutputError::InjectionFailed(e.to_string()))?;
+
+        // pbpaste exits 0 with empty output both for an empty clipboard and
+        // for text-free content; treat both as nothing to restore.
+        if !output.status.success() || output.stdout.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(ClipboardContent {
+            data: output.stdout,
+            mime_type: "text/plain".to_string(),
+        }))
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn restore_clipboard_content_macos(
+        &self,
+        content: &ClipboardContent,
+    ) -> Result<(), OutputError> {
+        // pbcopy only carries UTF-8 text; non-text clipboard content can't be
+        // restored on macOS, so keep the transcription instead.
+        let text = match std::str::from_utf8(&content.data) {
+            Ok(text) => text,
+            Err(_) => {
+                tracing::warn!("Clipboard restore skipped: non-UTF-8 content on macOS");
+                return Ok(());
+            }
+        };
+
+        let mut child = Command::new("pbcopy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    OutputError::InjectionFailed("pbcopy not found".to_string())
+                } else {
+                    OutputError::InjectionFailed(e.to_string())
+                }
+            })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(text.as_bytes())
+                .await
+                .map_err(|e| OutputError::InjectionFailed(e.to_string()))?;
+            drop(stdin);
+        }
+
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| OutputError::InjectionFailed(e.to_string()))?;
+
+        if !status.success() {
+            return Err(OutputError::InjectionFailed(
+                "pbcopy exited with error during restore".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn simulate_paste_keystroke_macos(&self) -> Result<(), OutputError> {
+        // driver_order/type_delay_ms only shape the Linux keystroke drivers;
+        // macOS always uses the CGEvent path.
+        tracing::debug!(
+            "macOS paste keystroke (type_delay_ms {} and driver_order {:?} ignored)",
+            self.type_delay_ms,
+            self.driver_order
+        );
+        let keystroke = self.keystroke.clone();
+        tokio::task::spawn_blocking(move || macos_paste::send_keystroke(&keystroke))
+            .await
+            .map_err(|e| OutputError::InjectionFailed(format!("Task join error: {}", e)))?
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn send_enter_macos(&self) -> Result<(), OutputError> {
+        tokio::task::spawn_blocking(macos_paste::post_return)
+            .await
+            .map_err(|e| OutputError::InjectionFailed(format!("Task join error: {}", e)))?
+    }
+
+    /// macOS probe: pbcopy/pbpaste are the only external requirements. The
+    /// keystroke step uses CGEvent directly; a missing Accessibility
+    /// permission surfaces as an actionable error at output time (same
+    /// philosophy as the cgevent type-mode output, whose is_available always
+    /// returns true to allow that helpful error).
+    #[cfg(target_os = "macos")]
+    async fn is_available_macos(&self) -> bool {
+        for tool in ["pbcopy", "pbpaste"] {
+            let installed = Command::new("which")
+                .arg(tool)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !installed {
+                tracing::debug!("paste mode unavailable: {} not found", tool);
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -944,8 +1155,19 @@ impl TextOutput for PasteOutput {
     }
 
     async fn is_available(&self) -> bool {
-        // Probe the appropriate clipboard tool for the active session.
-        // Wayland needs wl-copy; X11 needs xclip or xsel.
+        #[cfg(target_os = "macos")]
+        {
+            return self.is_available_macos().await;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        self.is_available_unix().await
+    }
+
+    /// Probe the appropriate clipboard tool for the active session.
+    /// Wayland needs wl-copy; X11 needs xclip or xsel.
+    #[cfg(not(target_os = "macos"))]
+    async fn is_available_unix(&self) -> bool {
         let session = detect();
         let clipboard_available = match session {
             DisplaySession::Wayland => Command::new("which")
@@ -1008,7 +1230,165 @@ impl TextOutput for PasteOutput {
     }
 
     fn name(&self) -> &'static str {
-        "paste (clipboard + keystroke)"
+        if cfg!(target_os = "macos") {
+            "paste (pbcopy + CGEvent keystroke)"
+        } else {
+            "paste (clipboard + keystroke)"
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos_paste {
+    //! macOS keystroke synthesis for paste mode.
+
+    use super::{OutputError, ParsedKeystroke};
+    use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    /// Carbon HIToolbox virtual keycode for V.
+    pub(super) const KEYCODE_V: CGKeyCode = 0x09;
+    /// Carbon HIToolbox virtual keycode for Return.
+    pub(super) const KEYCODE_RETURN: CGKeyCode = 0x24;
+
+    /// Map a keystroke's key name to a Carbon virtual keycode.
+    ///
+    /// Only keys paste mode plausibly binds are covered. Notably `insert` is
+    /// absent: Mac keyboards have no Insert key, so the shipped
+    /// `shift+insert` default falls back to cmd+v.
+    pub(super) fn keycode_for_key(key: &str) -> Option<CGKeyCode> {
+        let code: CGKeyCode = match key {
+            "a" => 0x00,
+            "s" => 0x01,
+            "d" => 0x02,
+            "f" => 0x03,
+            "h" => 0x04,
+            "g" => 0x05,
+            "z" => 0x06,
+            "x" => 0x07,
+            "c" => 0x08,
+            "v" => 0x09,
+            "b" => 0x0B,
+            "q" => 0x0C,
+            "w" => 0x0D,
+            "e" => 0x0E,
+            "r" => 0x0F,
+            "y" => 0x10,
+            "t" => 0x11,
+            "1" => 0x12,
+            "2" => 0x13,
+            "3" => 0x14,
+            "4" => 0x15,
+            "6" => 0x16,
+            "5" => 0x17,
+            "9" => 0x19,
+            "7" => 0x1A,
+            "8" => 0x1B,
+            "0" => 0x1D,
+            "o" => 0x1F,
+            "u" => 0x20,
+            "i" => 0x22,
+            "p" => 0x23,
+            "l" => 0x25,
+            "j" => 0x26,
+            "k" => 0x28,
+            "n" => 0x2D,
+            "m" => 0x2E,
+            "return" | "enter" => KEYCODE_RETURN,
+            "tab" => 0x30,
+            "space" => 0x31,
+            "delete" | "backspace" => 0x33,
+            "escape" | "esc" => 0x35,
+            _ => return None,
+        };
+        Some(code)
+    }
+
+    /// Map a parsed paste keystroke to macOS modifier flags and a virtual
+    /// keycode, falling back to cmd+v for keys with no Mac keycode.
+    pub(super) fn keystroke_spec(keystroke: &ParsedKeystroke) -> (CGEventFlags, CGKeyCode) {
+        let mut flags = CGEventFlags::empty();
+        for modifier in &keystroke.modifiers {
+            flags |= match modifier.as_str() {
+                "ctrl" | "control" | "ctl" => CGEventFlags::CGEventFlagControl,
+                "cmd" | "command" | "meta" | "super" | "win" => CGEventFlags::CGEventFlagCommand,
+                "alt" | "option" | "opt" => CGEventFlags::CGEventFlagAlternate,
+                "shift" => CGEventFlags::CGEventFlagShift,
+                other => {
+                    tracing::debug!("Unknown paste modifier '{}' ignored on macOS", other);
+                    CGEventFlags::empty()
+                }
+            };
+        }
+
+        match keycode_for_key(&keystroke.key) {
+            Some(code) => (flags, code),
+            None => {
+                tracing::warn!(
+                    "paste key '{}' has no macOS keycode; falling back to cmd+v",
+                    keystroke.key
+                );
+                (CGEventFlags::CGEventFlagCommand, KEYCODE_V)
+            }
+        }
+    }
+
+    /// Post one synthetic key event (down + up) with explicit flags, matching
+    /// the cgevent type-mode output's approach to stuck modifiers.
+    fn post_key(
+        source: &CGEventSource,
+        keycode: CGKeyCode,
+        flags: CGEventFlags,
+    ) -> Result<(), OutputError> {
+        let down = CGEvent::new_keyboard_event(source.clone(), keycode, true)
+            .map_err(|_| OutputError::InjectionFailed("Failed to create keyboard event".into()))?;
+        down.set_flags(flags);
+        down.post(CGEventTapLocation::HID);
+
+        let up = CGEvent::new_keyboard_event(source.clone(), keycode, false)
+            .map_err(|_| OutputError::InjectionFailed("Failed to create keyboard event".into()))?;
+        up.set_flags(flags);
+        up.post(CGEventTapLocation::HID);
+
+        Ok(())
+    }
+
+    fn accessibility_error() -> OutputError {
+        OutputError::InjectionFailed(
+            "Accessibility permission required.\n\
+             Grant access in: System Settings > Privacy & Security > Accessibility\n\
+             Then restart voxtype."
+                .into(),
+        )
+    }
+
+    pub(super) fn send_keystroke(keystroke: &ParsedKeystroke) -> Result<(), OutputError> {
+        if !crate::output::cgevent::CGEventOutput::check_accessibility_permission() {
+            return Err(accessibility_error());
+        }
+
+        let (flags, keycode) = keystroke_spec(keystroke);
+        tracing::debug!(
+            "macOS paste keystroke: keycode {} with flags {:?}",
+            keycode,
+            flags
+        );
+
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .map_err(|_| OutputError::InjectionFailed("Failed to create CGEventSource".into()))?;
+
+        post_key(&source, keycode, flags)
+    }
+
+    pub(super) fn post_return() -> Result<(), OutputError> {
+        if !crate::output::cgevent::CGEventOutput::check_accessibility_permission() {
+            return Err(accessibility_error());
+        }
+
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .map_err(|_| OutputError::InjectionFailed("Failed to create CGEventSource".into()))?;
+
+        post_key(&source, KEYCODE_RETURN, CGEventFlags::empty())
     }
 }
 
@@ -1099,5 +1479,46 @@ mod tests {
         assert!(debug_str.contains("[5 bytes]"));
         assert!(debug_str.contains("text/plain"));
         assert!(!debug_str.contains("[1, 2, 3"));
+    }
+
+    #[cfg(target_os = "macos")]
+    mod macos_tests {
+        use super::*;
+        use core_graphics::event::CGEventFlags;
+
+        #[test]
+        fn test_keycode_mapping_covers_paste_keys() {
+            assert_eq!(macos_paste::keycode_for_key("v"), Some(0x09));
+            assert_eq!(macos_paste::keycode_for_key("c"), Some(0x08));
+            assert_eq!(macos_paste::keycode_for_key("return"), Some(0x24));
+            // Macs have no Insert key: the shipped shift+insert default must
+            // not silently map to a wrong keycode.
+            assert_eq!(macos_paste::keycode_for_key("insert"), None);
+        }
+
+        #[test]
+        fn test_keystroke_spec_maps_ctrl_v() {
+            let keystroke = ParsedKeystroke::parse("ctrl+v").unwrap();
+            let (flags, code) = macos_paste::keystroke_spec(&keystroke);
+            assert_eq!(code, 0x09);
+            assert_eq!(flags, CGEventFlags::CGEventFlagControl);
+        }
+
+        #[test]
+        fn test_keystroke_spec_maps_cmd_v() {
+            let keystroke = ParsedKeystroke::parse("cmd+v").unwrap();
+            let (flags, code) = macos_paste::keystroke_spec(&keystroke);
+            assert_eq!(code, 0x09);
+            assert_eq!(flags, CGEventFlags::CGEventFlagCommand);
+        }
+
+        #[test]
+        fn test_keystroke_spec_falls_back_to_cmd_v_for_shift_insert() {
+            // Shipped default has no macOS meaning; paste mode must still work.
+            let keystroke = ParsedKeystroke::parse("shift+insert").unwrap();
+            let (flags, code) = macos_paste::keystroke_spec(&keystroke);
+            assert_eq!(code, macos_paste::KEYCODE_V);
+            assert_eq!(flags, CGEventFlags::CGEventFlagCommand);
+        }
     }
 }

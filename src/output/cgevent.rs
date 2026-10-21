@@ -47,8 +47,9 @@ impl CGEventOutput {
         }
     }
 
-    /// Check if Accessibility permissions are granted
-    fn check_accessibility_permission() -> bool {
+    /// Check if Accessibility permissions are granted.
+    /// Shared with the macOS paste-mode keystroke path.
+    pub(crate) fn check_accessibility_permission() -> bool {
         #[link(name = "ApplicationServices", kind = "framework")]
         extern "C" {
             fn AXIsProcessTrusted() -> bool;

@@ -1951,7 +1951,7 @@ Primary output method.
 **Values:**
 - `type` - Simulate keyboard input at cursor position (uses wtype, dotool, or ydotool)
 - `clipboard` - Copy text to clipboard (requires wl-copy)
-- `paste` - Copy to clipboard then simulate paste keystroke (requires wl-copy, and wtype, dotool, or ydotool)
+- `paste` - Copy to clipboard then simulate paste keystroke (Linux: requires wl-copy, and wtype, dotool, or ydotool; macOS: pbcopy/pbpaste plus a synthetic CGEvent keystroke, no external tools)
 - `file` - Write transcription to a file (requires `file_path` to be set)
 
 **Example:**
@@ -1981,7 +1981,7 @@ voxtype's variants. When using dotool, you must also switch the active desktop
 keyboard layout to the language/variant you want to type in.
 
 **Note about paste mode:**
-The `paste` mode is an alternative for non-US keyboard layouts. Instead of typing characters directly, it copies text to the clipboard and simulates a paste keystroke. This works regardless of keyboard layout but overwrites your clipboard. Requires wl-copy for clipboard access.
+The `paste` mode is an alternative for non-US keyboard layouts. Instead of typing characters directly, it copies text to the clipboard and simulates a paste keystroke. This works regardless of keyboard layout but overwrites your clipboard. On Linux it requires wl-copy for clipboard access. On macOS it uses the built-in pbcopy/pbpaste and posts the paste keystroke via CGEvent, so it needs the same Accessibility permission as type mode.
 
 ### paste_keys
 
@@ -1997,6 +1997,8 @@ Keystroke to simulate for paste mode. The shipped default is `shift+insert` beca
 - `"shift+insert"` - Universal paste shortcut, works in terminals and GUI apps (shipped default)
 - `"ctrl+v"` - Standard GUI paste shortcut
 - `"ctrl+shift+v"` - Some terminal emulators
+
+On macOS, keys with no Mac keycode (notably `insert`, since Mac keyboards have no Insert key) fall back to `cmd+v` with a warning, and `ctrl` maps to the literal Control key rather than Command — set `"cmd+v"` explicitly if you want the Mac-standard paste chord. Clipboard restoration (`restore_clipboard`) keeps only UTF-8 text on macOS.
 
 **Example:**
 ```toml
